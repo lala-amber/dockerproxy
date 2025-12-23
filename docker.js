@@ -1,8 +1,67 @@
 const dockerHub = 'https://registry-1.docker.io'
 
+const CONTROL_TIMEOUT_MS = 15000
+const BLOB_TIMEOUT_MS = 120000
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 1000
+
 function buildRoutes(host) {
   // 如未来扩展多个源，这里务必做白名单校验
   return { [host]: dockerHub }
+}
+
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function fetchWithTimeout(resource, options = {}, timeout = CONTROL_TIMEOUT_MS) {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+  try {
+    const fetchOptions = {
+      ...options,
+      signal: controller.signal
+    }
+    const response = await fetch(resource, fetchOptions)
+    clearTimeout(timeoutId)
+    return response
+  } catch (error) {
+    clearTimeout(timeoutId)
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout')
+    }
+    throw error
+  }
+}
+
+async function fetchWithRetry(resource, options = {}) {
+  const { retries = MAX_RETRIES, timeout = CONTROL_TIMEOUT_MS, ...fetchOptions } = options
+  let lastError
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetchWithTimeout(resource, fetchOptions, timeout)
+      if (response.ok || response.status === 401 || response.status === 307) {
+        return response
+      }
+      if (response.status >= 500 && i < retries - 1) {
+        const delay = i === 0 ? 500 : RETRY_DELAY_MS * i
+        await sleep(delay)
+        continue
+      }
+      return response
+    } catch (error) {
+      lastError = error
+      if (i < retries - 1) {
+        const delay = i === 0 ? 500 : RETRY_DELAY_MS * i
+        await sleep(delay)
+        continue
+      }
+    }
+  }
+
+  throw lastError || new Error('Max retries reached')
 }
 
 function json(body, status = 200, extra = {}) {
@@ -28,6 +87,14 @@ function addCors(resp) {
   headers.set('Access-Control-Allow-Origin', '*')
   headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
   headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept, Range')
+
+  if (!headers.has('Connection')) {
+    headers.set('Connection', 'keep-alive')
+  }
+  if (!headers.has('Keep-Alive')) {
+    headers.set('Keep-Alive', 'timeout=120')
+  }
+
   return new Response(resp.body, { status: resp.status, headers })
 }
 
@@ -49,6 +116,10 @@ function withLibraryPrefix(url) {
   return url
 }
 
+function isBlobRequest(pathname) {
+  return /^\/v2\/.+\/blobs\//i.test(pathname)
+}
+
 function parseAuthenticate(authenticateStr) {
   // 尽量稳健解析形如: Bearer realm="...",service="...",scope="..."
   const realmMatch = authenticateStr.match(/realm="([^"]+)"/i)
@@ -65,7 +136,7 @@ async function fetchToken(wwwAuthenticate, scope, authorization) {
   const headers = new Headers()
   if (authorization) headers.set('Authorization', authorization)
 
-  return fetch(url.toString(), { method: 'GET', headers, redirect: 'follow' })
+  return fetchWithRetry(url.toString(), { method: 'GET', headers, redirect: 'follow' })
 }
 
 function responseUnauthorized(url) {
@@ -89,6 +160,20 @@ export default {
       return addCors(allowMethods())
     }
 
+    try {
+      return await handleRequest(request, url)
+    } catch (error) {
+      console.error('Worker error:', error)
+      return addCors(json({
+        error: 'Internal server error',
+        message: error.message || 'Unknown error'
+      }, 502))
+    }
+  },
+}
+
+async function handleRequest(request, url) {
+
     // 根路径跳转
     if (url.pathname === '/') {
       return addCors(Response.redirect(url.protocol + '//' + url.host + '/v2/', 301))
@@ -109,14 +194,14 @@ export default {
       const headers = new Headers()
       if (authorization) headers.set('Authorization', authorization)
 
-      const resp = await fetch(newUrl.toString(), { method: 'GET', headers, redirect: 'follow' })
+      const resp = await fetchWithRetry(newUrl.toString(), { method: 'GET', headers, redirect: 'follow' })
       if (resp.status === 401) return addCors(responseUnauthorized(url))
       return addCors(resp)
     }
 
     // /v2/auth - 代理获取 token
     if (url.pathname === '/v2/auth') {
-      const probe = await fetch(new URL(upstream + '/v2/').toString(), { method: 'GET', redirect: 'follow' })
+      const probe = await fetchWithRetry(new URL(upstream + '/v2/').toString(), { method: 'GET', redirect: 'follow' })
       if (probe.status !== 401) return addCors(probe)
 
       const authenticateStr = probe.headers.get('WWW-Authenticate')
@@ -151,13 +236,22 @@ export default {
 
     // 转发请求
     const newUrl = new URL(upstream + url.pathname + (url.search || ''))
+
+    const filteredHeaders = new Headers()
+    for (const [key, value] of request.headers.entries()) {
+      if (!key.toLowerCase().startsWith('cf-') && key.toLowerCase() !== 'host') {
+        filteredHeaders.set(key, value)
+      }
+    }
+
     const newReq = new Request(newUrl, {
       method: request.method,
-      headers: request.headers,
+      headers: filteredHeaders,
       redirect: isDockerHub ? 'manual' : 'follow',
     })
 
-    const resp = await fetch(newReq)
+    const timeout = isBlobRequest(url.pathname) ? BLOB_TIMEOUT_MS : CONTROL_TIMEOUT_MS
+    const resp = await fetchWithRetry(newReq, { timeout })
 
     if (resp.status === 401) {
       return addCors(responseUnauthorized(url))
@@ -181,10 +275,13 @@ export default {
         return addCors(resp)
       }
 
-      const redirectResp = await fetch(locationUrl.toString(), { method: 'GET', redirect: 'follow' })
+      const redirectResp = await fetchWithRetry(locationUrl.toString(), {
+        method: 'GET',
+        redirect: 'follow',
+        timeout: BLOB_TIMEOUT_MS
+      })
       return addCors(redirectResp)
     }
 
     return addCors(resp)
-  },
 }
