@@ -1,12 +1,15 @@
 /**
  * EdgeOne Pages Functions: Docker Hub reverse proxy for Docker Registry V2
- * - Works as Docker "registry-mirrors"
- * - Handles /v2/ ping (GET/HEAD)
- * - Provides local /v2/auth token proxy
- * - Adds "library/" prefix for single-segment repos
- * - (Optional) Follows DockerHub 307 redirects for blobs WITH Range passthrough
+ * Goal: work reliably as Docker "registry-mirrors" on Pages environment.
  *
- * Put this file at: functions/[[...path]].js
+ * Key behaviors:
+ *  - /v2/ ping supports GET/HEAD
+ *  - /v2/auth proxies token from DockerHub auth realm
+ *  - Adds library/ prefix for single-segment repos
+ *  - IMPORTANT: For blobs, DO NOT download in Pages on 307. Just pass 307+Location to client.
+ *    (Pages doing large blob streaming is prone to timeouts / limits.)
+ *  - IMPORTANT: Only rewrite 401 to local challenge when client has NO Authorization header.
+ *    If client already has Authorization and still 401, pass through upstream 401 to avoid loops.
  */
 
 const DOCKER_HUB = "https://registry-1.docker.io";
@@ -18,8 +21,6 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
 function buildRoutes(hostname) {
-  // Host allowlist mapping (current host -> Docker Hub).
-  // If you want multiple hosts, expand this map carefully.
   return { [hostname]: DOCKER_HUB };
 }
 
@@ -49,10 +50,8 @@ async function fetchWithRetry(resource, options = {}) {
     try {
       const resp = await fetchWithTimeout(resource, fetchOptions, timeout);
 
-      // Pass-through: ok / auth challenge / redirect to blob store
       if (resp.ok || resp.status === 401 || resp.status === 307) return resp;
 
-      // Retry on 5xx
       if (resp.status >= 500 && i < retries - 1) {
         const delay = i === 0 ? 500 : RETRY_DELAY_MS * i;
         await sleep(delay);
@@ -76,24 +75,23 @@ function json(body, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
       ...extraHeaders,
     },
   });
 }
 
 function allowMethods() {
-  return new Response(null, {
-    status: 405,
-    headers: { Allow: "GET, HEAD, OPTIONS" },
-  });
+  return new Response(null, { status: 405, headers: { Allow: "GET, HEAD, OPTIONS" } });
 }
 
-// Docker daemon does not need CORS; leaving it harmless.
 function addCors(resp) {
   const headers = new Headers(resp.headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Range");
+  // Docker registry responses should not be cached
+  if (!headers.has("Cache-Control")) headers.set("Cache-Control", "no-store");
   return new Response(resp.body, { status: resp.status, headers });
 }
 
@@ -134,19 +132,18 @@ async function fetchToken({ realm, service }, scope, authorization) {
   return fetchWithRetry(u.toString(), { method: "GET", headers, redirect: "follow" });
 }
 
-// Return a local challenge so Docker daemon fetches token from our /v2/auth
-function responseUnauthorized(hostname) {
-  const headers = {
+function localChallenge(hostname) {
+  // Challenge points to our /v2/auth, with DockerHub-like service
+  return {
     "WWW-Authenticate": `Bearer realm="https://${hostname}/v2/auth",service="registry.docker.io"`,
+    "Cache-Control": "no-store",
   };
-  return json({ message: "UNAUTHORIZED" }, 401, headers);
 }
 
 function filterRequestHeaders(requestHeaders) {
   const out = new Headers();
   for (const [k, v] of requestHeaders.entries()) {
     const lk = k.toLowerCase();
-    // Strip hop-by-hop and platform-specific headers
     if (lk.startsWith("cf-")) continue;
     if (lk === "host") continue;
     if (lk === "connection") continue;
@@ -157,20 +154,14 @@ function filterRequestHeaders(requestHeaders) {
     if (lk === "trailers") continue;
     if (lk === "transfer-encoding") continue;
     if (lk === "upgrade") continue;
-
     out.set(k, v);
   }
   return out;
 }
 
-/**
- * EdgeOne Pages Functions entry.
- * Ensure this file is catch-all so /v2/* never falls back to Pages 404.
- */
 export async function onRequest(context) {
   const request = context.request;
 
-  // Methods
   if (request.method === "OPTIONS") {
     return addCors(new Response(null, { status: 204 }));
   }
@@ -179,20 +170,15 @@ export async function onRequest(context) {
   }
 
   const url = new URL(request.url);
-
   try {
     return await handleRequest(request, url);
   } catch (e) {
-    // EdgeOne Pages logs
     console.error("EdgeOne Pages function error:", e);
-    return addCors(
-      json({ error: "Bad Gateway", message: e?.message || "Unknown error" }, 502)
-    );
+    return addCors(json({ error: "Bad Gateway", message: e?.message || "Unknown error" }, 502));
   }
 }
 
 async function handleRequest(request, url) {
-  // Root redirect (optional)
   if (url.pathname === "/") {
     return addCors(Response.redirect(`${url.protocol}//${url.host}/v2/`, 301));
   }
@@ -204,9 +190,8 @@ async function handleRequest(request, url) {
   }
 
   const isDockerHub = upstream === DOCKER_HUB;
-  const authorization = request.headers.get("Authorization");
+  const authz = request.headers.get("Authorization");
 
-  // Normalize /v2 -> /v2/
   if (url.pathname === "/v2") {
     const u = new URL(url.toString());
     u.pathname = "/v2/";
@@ -217,20 +202,23 @@ async function handleRequest(request, url) {
   if (url.pathname === "/v2/") {
     const pingUrl = new URL(upstream + "/v2/");
     const headers = new Headers();
-    if (authorization) headers.set("Authorization", authorization);
+    if (authz) headers.set("Authorization", authz);
 
     const resp = await fetchWithRetry(pingUrl.toString(), {
-      method: request.method, // forward HEAD/GET
+      method: request.method, // HEAD/GET
       headers,
       redirect: "follow",
     });
 
-    // Upstream requires auth -> challenge locally
-    if (resp.status === 401) return addCors(responseUnauthorized(url.hostname));
+    // Only challenge when client has no auth
+    if (resp.status === 401 && !authz) {
+      // minimal body (some clients don't care); JSON is fine, but keep it small
+      return addCors(json({ message: "UNAUTHORIZED" }, 401, localChallenge(url.hostname)));
+    }
     return addCors(resp);
   }
 
-  // /v2/auth - local token proxy
+  // /v2/auth - token proxy
   if (url.pathname === "/v2/auth") {
     const probe = await fetchWithRetry(new URL(upstream + "/v2/").toString(), {
       method: "GET",
@@ -249,9 +237,9 @@ async function handleRequest(request, url) {
       return addCors(json({ message: "Bad WWW-Authenticate from upstream" }, 502));
     }
 
-    // Scope rewrite for DockerHub single segment repo -> library/<name>
     let scope = url.searchParams.get("scope");
     if (scope && isDockerHub) {
+      // repository:hello-world:pull -> repository:library/hello-world:pull
       const parts = scope.split(":");
       if (parts.length === 3 && !parts[1].includes("/")) {
         parts[1] = "library/" + parts[1];
@@ -259,17 +247,20 @@ async function handleRequest(request, url) {
       }
     }
 
-    const tokenResp = await fetchToken(wwwAuth, scope, authorization);
-    return addCors(tokenResp);
+    const tokenResp = await fetchToken(wwwAuth, scope, authz);
+    // Ensure no-store (token responses should not be cached)
+    const h = new Headers(tokenResp.headers);
+    h.set("Cache-Control", "no-store");
+    return addCors(new Response(tokenResp.body, { status: tokenResp.status, headers: h }));
   }
 
-  // DockerHub library redirect for single-segment repos
+  // library/ prefix for single-segment repos
   if (isDockerHub && needsLibraryPrefix(url.pathname)) {
     const redirectUrl = withLibraryPrefix(new URL(url.toString()));
     return addCors(Response.redirect(redirectUrl.toString(), 301));
   }
 
-  // Forward to upstream
+  // Forward request
   const newUrl = new URL(upstream + url.pathname + (url.search || ""));
   const headers = filterRequestHeaders(request.headers);
 
@@ -282,47 +273,33 @@ async function handleRequest(request, url) {
   const timeout = isBlobRequest(url.pathname) ? BLOB_TIMEOUT_MS : CONTROL_TIMEOUT_MS;
   const resp = await fetchWithRetry(newReq, { timeout });
 
-  // Convert upstream 401 -> local auth challenge
+  // If upstream returns 401:
+  // - if client has no Authorization: respond with local challenge (to /v2/auth)
+  // - if client already has Authorization: pass-through upstream 401 (do NOT re-challenge)
   if (resp.status === 401) {
-    return addCors(responseUnauthorized(url.hostname));
+    if (!authz) {
+      return addCors(json({ message: "UNAUTHORIZED" }, 401, localChallenge(url.hostname)));
+    }
+    return addCors(resp);
   }
 
-  // Handle DockerHub blob 307
-  // IMPORTANT FIX: when following 307 internally, forward Range/Accept headers, and preserve HEAD vs GET.
+  // CRITICAL: For blobs, do NOT fetch the 307 Location in Pages. Pass it to the Docker client.
+  // Docker client will follow Location and download from the blob store directly.
+  if (isDockerHub && resp.status === 307 && isBlobRequest(url.pathname)) {
+    const h = new Headers(resp.headers);
+    h.set("Cache-Control", "no-store");
+    return addCors(new Response(null, { status: 307, headers: h }));
+  }
+
+  // For non-blob 307 (rare), just pass through
   if (isDockerHub && resp.status === 307) {
-    const loc = resp.headers.get("Location");
-    if (!loc) return addCors(resp);
-
-    let locationUrl;
-    try {
-      locationUrl = new URL(loc, upstream);
-    } catch {
-      return addCors(resp);
-    }
-
-    if (locationUrl.protocol !== "https:") {
-      return addCors(resp);
-    }
-
-    // Forward only safe headers needed for blob fetch
-    const h = new Headers();
-    const range = request.headers.get("Range");
-    if (range) h.set("Range", range);
-    const accept = request.headers.get("Accept");
-    if (accept) h.set("Accept", accept);
-    const acceptEncoding = request.headers.get("Accept-Encoding");
-    if (acceptEncoding) h.set("Accept-Encoding", acceptEncoding);
-
-    // Keep method consistent (HEAD should remain HEAD)
-    const redirected = await fetchWithRetry(locationUrl.toString(), {
-      method: request.method,
-      headers: h,
-      redirect: "follow",
-      timeout: BLOB_TIMEOUT_MS,
-    });
-
-    return addCors(redirected);
+    const h = new Headers(resp.headers);
+    h.set("Cache-Control", "no-store");
+    return addCors(new Response(resp.body, { status: 307, headers: h }));
   }
 
-  return addCors(resp);
+  // Normal pass-through, enforce no-store
+  const h = new Headers(resp.headers);
+  if (!h.has("Cache-Control")) h.set("Cache-Control", "no-store");
+  return addCors(new Response(resp.body, { status: resp.status, headers: h }));
 }
